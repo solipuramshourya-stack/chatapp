@@ -1,8 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { streamChat, chatWithCsvTools, CODE_KEYWORDS } from '../services/gemini';
+import { streamChat, chatWithCsvTools, chatWithYoutubeTools, CODE_KEYWORDS } from '../services/gemini';
 import { parseCsvToRows, executeTool, computeDatasetSummary, enrichWithEngagement, buildSlimCsv } from '../services/csvTools';
+import { executeYoutubeTool } from '../services/youtubeTools';
 import {
   getSessions,
   createSession,
@@ -11,6 +12,9 @@ import {
   loadMessages,
 } from '../services/mongoApi';
 import EngagementChart from './EngagementChart';
+import MetricVsTimeChart from './MetricVsTimeChart';
+import PlayVideoCard from './PlayVideoCard';
+import YouTubeDownload from './YouTubeDownload';
 import './Chat.css';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -37,11 +41,10 @@ const parseCSV = (text) => {
   // Short human-readable preview (header + first 5 rows) for context
   const preview = lines.slice(0, 6).join('\n');
 
-  // Full CSV as base64 — avoids ALL string-escaping issues in Python code execution
-  // (tweet text with quotes, apostrophes, emojis, etc. all break triple-quoted strings)
-  const raw = text.length > 500000 ? text.slice(0, 500000) : text;
+  // Full CSV as base64 — avoids string-escaping issues. Capped at 100k chars to stay under 1M token limit.
+  const raw = text.length > 100000 ? text.slice(0, 100000) : text;
   const base64 = toBase64(raw);
-  const truncated = text.length > 500000;
+  const truncated = text.length > 100000;
 
   return { headers, rowCount, preview, base64, truncated };
 };
@@ -53,6 +56,31 @@ const messageText = (m) => {
 };
 
 // ── Structured part renderer (code execution responses) ───────────────────────
+
+function GeneratedImageBlock({ imageBase64, mimeType }) {
+  const [lightbox, setLightbox] = useState(false);
+  const src = `data:${mimeType || 'image/png'};base64,${imageBase64}`;
+  const handleDownload = () => {
+    const a = document.createElement('a');
+    a.href = src;
+    a.download = `generated-image.${mimeType === 'image/jpeg' ? 'jpg' : 'png'}`;
+    a.click();
+  };
+  return (
+    <div className="chat-generated-image-wrap">
+      <img src={src} alt="Generated" onClick={() => setLightbox(true)} />
+      <div className="chat-generated-image-actions">
+        <button type="button" onClick={handleDownload}>Download</button>
+        <button type="button" onClick={() => setLightbox(true)}>Enlarge</button>
+      </div>
+      {lightbox && (
+        <div className="chat-generated-image-lightbox" onClick={() => setLightbox(false)}>
+          <img src={src} alt="Generated" onClick={(e) => e.stopPropagation()} />
+        </div>
+      )}
+    </div>
+  );
+}
 
 function StructuredParts({ parts }) {
   return (
@@ -110,7 +138,10 @@ function StructuredParts({ parts }) {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-export default function Chat({ username, onLogout }) {
+export default function Chat({ user, onLogout }) {
+  const username = user?.username ?? user;
+  const displayName = [user?.firstName, user?.lastName].filter(Boolean).join(' ') || username;
+  const userContextForAi = [user?.firstName, user?.lastName].filter(Boolean).join(' ') || null;
   const [sessions, setSessions] = useState([]);
   const [activeSessionId, setActiveSessionId] = useState(null);
   const [messages, setMessages] = useState([]);
@@ -121,9 +152,12 @@ export default function Chat({ username, onLogout }) {
   const [sessionCsvHeaders, setSessionCsvHeaders] = useState(null); // headers for tool routing
   const [csvDataSummary, setCsvDataSummary] = useState(null);    // auto-computed column stats summary
   const [sessionSlimCsv, setSessionSlimCsv] = useState(null);   // key-columns CSV string sent directly to Gemini
+  const [jsonContext, setJsonContext] = useState(null);          // { name, videoCount } for chip
+  const [sessionJsonData, setSessionJsonData] = useState(null);  // array of video objects for YouTube tools
   const [streaming, setStreaming] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [openMenuId, setOpenMenuId] = useState(null);
+  const [mainView, setMainView] = useState('chat'); // 'chat' | 'youtube'
 
   const bottomRef = useRef(null);
   const inputRef = useRef(null);
@@ -179,6 +213,8 @@ export default function Chat({ username, onLogout }) {
     setCsvContext(null);
     setSessionCsvRows(null);
     setSessionCsvHeaders(null);
+    setJsonContext(null);
+    setSessionJsonData(null);
   };
 
   const handleSelectSession = (sessionId) => {
@@ -189,6 +225,8 @@ export default function Chat({ username, onLogout }) {
     setCsvContext(null);
     setSessionCsvRows(null);
     setSessionCsvHeaders(null);
+    setJsonContext(null);
+    setSessionJsonData(null);
   };
 
   const handleDeleteSession = async (sessionId, e) => {
@@ -228,6 +266,20 @@ export default function Chat({ username, onLogout }) {
 
     const csvFiles = files.filter((f) => f.name.endsWith('.csv') || f.type === 'text/csv');
     const imageFiles = files.filter((f) => f.type.startsWith('image/'));
+    const jsonFiles = files.filter((f) => f.name.endsWith('.json') || f.type === 'application/json');
+
+    if (jsonFiles.length > 0) {
+      const file = jsonFiles[0];
+      const text = await fileToText(file);
+      try {
+        const data = JSON.parse(text);
+        const videos = Array.isArray(data) ? data : (data.videos || []);
+        setJsonContext({ name: file.name, videoCount: videos.length });
+        setSessionJsonData(videos);
+      } catch {
+        // ignore invalid JSON
+      }
+    }
 
     if (csvFiles.length > 0) {
       const file = csvFiles[0];
@@ -263,6 +315,19 @@ export default function Chat({ username, onLogout }) {
 
     const csvFiles = files.filter((f) => f.name.endsWith('.csv') || f.type === 'text/csv');
     const imageFiles = files.filter((f) => f.type.startsWith('image/'));
+    const jsonFiles = files.filter((f) => f.name.endsWith('.json') || f.type === 'application/json');
+
+    if (jsonFiles.length > 0) {
+      const text = await fileToText(jsonFiles[0]);
+      try {
+        const data = JSON.parse(text);
+        const videos = Array.isArray(data) ? data : (data.videos || []);
+        setJsonContext({ name: jsonFiles[0].name, videoCount: videos.length });
+        setSessionJsonData(videos);
+      } catch {
+        // ignore invalid JSON
+      }
+    }
 
     if (csvFiles.length > 0) {
       const text = await fileToText(csvFiles[0]);
@@ -320,7 +385,7 @@ export default function Chat({ username, onLogout }) {
 
   const handleSend = async () => {
     const text = input.trim();
-    if ((!text && !images.length && !csvContext) || streaming || !activeSessionId) return;
+    if ((!text && !images.length && !csvContext && !jsonContext) || streaming || !activeSessionId) return;
 
     // Lazily create the session in DB on the very first message
     let sessionId = activeSessionId;
@@ -337,16 +402,18 @@ export default function Chat({ username, onLogout }) {
     // PYTHON_ONLY = things the client tools genuinely cannot produce
     const PYTHON_ONLY_KEYWORDS = /\b(regression|scatter|histogram|seaborn|matplotlib|numpy|time.?series|heatmap|box.?plot|violin|distribut|linear.?model|logistic|forecast|trend.?line)\b/i;
     const wantPythonOnly = PYTHON_ONLY_KEYWORDS.test(text);
-    const wantCode = CODE_KEYWORDS.test(text) && !sessionCsvRows;
+    const wantCode = CODE_KEYWORDS.test(text) && !sessionCsvRows && !sessionJsonData?.length;
     const capturedCsv = csvContext;
     const hasCsvInSession = !!sessionCsvRows || !!capturedCsv;
     // Base64 is only worth sending when Gemini will actually run Python
     const needsBase64 = !!capturedCsv && wantPythonOnly;
     // Mode selection:
+    //   useYoutubeTools — JSON channel data loaded → YouTube tools (plot, play_video, compute_stats_json, generateImage)
     //   useTools        — CSV loaded + no Python needed → client-side JS tools (free, fast)
     //   useCodeExecution — Python explicitly needed (regression, histogram, etc.)
-    //   else            — Google Search streaming (also used for "tell me about this file")
-    const useTools = !!sessionCsvRows && !wantPythonOnly && !wantCode && !capturedCsv;
+    //   else            — Google Search streaming
+    const useYoutubeTools = !!sessionJsonData?.length && !wantPythonOnly && !wantCode;
+    const useTools = !!sessionCsvRows && !wantPythonOnly && !wantCode && !capturedCsv && !useYoutubeTools;
     const useCodeExecution = wantPythonOnly || wantCode;
 
     // ── Build prompt ─────────────────────────────────────────────────────────
@@ -386,10 +453,14 @@ ${sessionSummary}${slimCsvBlock}
       ? `[CSV columns: ${sessionCsvHeaders?.join(', ')}]\n\n${sessionSummary}\n\n---\n\n`
       : '';
 
+    const jsonPrefix = sessionJsonData?.length
+      ? `[YouTube channel JSON loaded: ${sessionJsonData.length} videos. Fields: ${Object.keys(sessionJsonData[0] || {}).join(', ')}.]\n\n---\n\n`
+      : '';
+
     // userContent  — displayed in bubble and stored in MongoDB (never contains base64)
     // promptForGemini — sent to the Gemini API (may contain the full prefix)
-    const userContent = text || (images.length ? '(Image)' : '(CSV attached)');
-    const promptForGemini = csvPrefix + (text || (images.length ? 'What do you see in this image?' : 'Please analyze this CSV data.'));
+    const userContent = text || (images.length ? '(Image)' : csvContext ? '(CSV attached)' : '(JSON attached)');
+    const promptForGemini = csvPrefix + jsonPrefix + (text || (images.length ? 'What do you see in this image?' : csvContext ? 'Please analyze this CSV data.' : 'Please analyze this channel data.'));
 
     const userMsg = {
       id: `u-${Date.now()}`,
@@ -398,6 +469,7 @@ ${sessionSummary}${slimCsvBlock}
       timestamp: new Date().toISOString(),
       images: [...images],
       csvName: capturedCsv?.name || null,
+      jsonName: jsonContext?.name || null,
     };
 
     setMessages((m) => [...m, userMsg]);
@@ -405,6 +477,8 @@ ${sessionSummary}${slimCsvBlock}
     const capturedImages = [...images];
     setImages([]);
     setCsvContext(null);
+    const capturedJson = sessionJsonData;
+    // Do NOT clear jsonContext / sessionJsonData — keep JSON in context for the whole chat
     setStreaming(true);
 
     // Store display text only — base64 is never persisted
@@ -432,14 +506,62 @@ ${sessionSummary}${slimCsvBlock}
     let toolCalls = [];
 
     try {
-      if (useTools) {
+      if (useYoutubeTools) {
+        const generateImageFn = async (prompt) => {
+          try {
+            const body = { prompt };
+            if (capturedImages.length > 0) {
+              body.imageBase64 = capturedImages[0].data;
+              body.mimeType = capturedImages[0].mimeType || 'image/png';
+            }
+            const res = await fetch('/api/generate-image', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(body),
+            });
+            const data = await res.json();
+            if (data.ok && data.imageBase64) {
+              return { _chartType: 'generated_image', imageBase64: data.imageBase64, mimeType: data.mimeType || 'image/png' };
+            }
+            return { error: data.error || 'Image generation failed' };
+          } catch (err) {
+            return { error: err.message || 'Image generation failed' };
+          }
+        };
+        const executeFn = async (toolName, args) => {
+          return executeYoutubeTool(toolName, args, capturedJson, generateImageFn);
+        };
+        const { text: answer, charts: returnedCharts, toolCalls: returnedCalls } = await chatWithYoutubeTools(
+          history,
+          promptForGemini,
+          capturedJson,
+          executeFn,
+          userContextForAi
+        );
+        fullContent = answer;
+        toolCharts = returnedCharts || [];
+        toolCalls = returnedCalls || [];
+        setMessages((m) =>
+          m.map((msg) =>
+            msg.id === assistantId
+              ? {
+                  ...msg,
+                  content: fullContent,
+                  charts: toolCharts.length ? toolCharts : undefined,
+                  toolCalls: toolCalls.length ? toolCalls : undefined,
+                }
+              : msg
+          )
+        );
+      } else if (useTools) {
         // ── Function-calling path: Gemini picks tool + args, JS executes ──────
         console.log('[Chat] useTools=true | rows:', sessionCsvRows.length, '| headers:', sessionCsvHeaders);
         const { text: answer, charts: returnedCharts, toolCalls: returnedCalls } = await chatWithCsvTools(
           history,
           promptForGemini,
           sessionCsvHeaders,
-          (toolName, args) => executeTool(toolName, args, sessionCsvRows)
+          (toolName, args) => executeTool(toolName, args, sessionCsvRows),
+          userContextForAi
         );
         fullContent = answer;
         toolCharts = returnedCharts || [];
@@ -460,7 +582,7 @@ ${sessionSummary}${slimCsvBlock}
         );
       } else {
         // ── Streaming path: code execution or search ─────────────────────────
-        for await (const chunk of streamChat(history, promptForGemini, imageParts, useCodeExecution)) {
+        for await (const chunk of streamChat(history, promptForGemini, imageParts, useCodeExecution, userContextForAi)) {
           if (abortRef.current) break;
           if (chunk.type === 'text') {
             fullContent += chunk.text;
@@ -538,6 +660,20 @@ ${sessionSummary}${slimCsvBlock}
           <button className="new-chat-btn" onClick={handleNewChat}>
             + New Chat
           </button>
+          <button
+            type="button"
+            className={`sidebar-tab-btn${mainView === 'youtube' ? ' active' : ''}`}
+            onClick={() => setMainView('youtube')}
+          >
+            YouTube Channel Download
+          </button>
+          <button
+            type="button"
+            className={`sidebar-tab-btn${mainView === 'chat' ? ' active' : ''}`}
+            onClick={() => setMainView('chat')}
+          >
+            Chat
+          </button>
         </div>
 
         <div className="sidebar-sessions">
@@ -575,7 +711,7 @@ ${sessionSummary}${slimCsvBlock}
         </div>
 
         <div className="sidebar-footer">
-          <span className="sidebar-username">{username}</span>
+          <span className="sidebar-username">{displayName}</span>
           <button onClick={onLogout} className="sidebar-logout">
             Log out
           </button>
@@ -584,6 +720,9 @@ ${sessionSummary}${slimCsvBlock}
 
       {/* ── Main chat area ───────────────────────── */}
       <div className="chat-main">
+        {mainView === 'youtube' ? (
+          <YouTubeDownload />
+        ) : (
         <>
         <header className="chat-header">
           <h2 className="chat-header-title">{activeSession?.title ?? 'New Chat'}</h2>
@@ -595,19 +734,27 @@ ${sessionSummary}${slimCsvBlock}
           onDragLeave={() => setDragOver(false)}
           onDrop={handleDrop}
         >
+          {messages.length === 0 ? (
+            <div className="chat-empty-state">
+              <p className="chat-empty-title">YouTube AI Chat Assistant</p>
+              <p>Ask questions, analyze channel data, or drag a JSON file here.</p>
+              <p>Use the YouTube Channel Download tab to fetch video metadata, then drag the JSON into chat to analyze.</p>
+            </div>
+          ) : (
+          <div className="chat-messages-inner">
           {messages.map((m) => (
             <div key={m.id} className={`chat-msg ${m.role}`}>
               <div className="chat-msg-meta">
-                <span className="chat-msg-role">{m.role === 'user' ? username : 'Lisa'}</span>
+                <span className="chat-msg-role">{m.role === 'user' ? displayName : 'Assistant'}</span>
                 <span className="chat-msg-time">
                   {new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                 </span>
               </div>
 
               {/* CSV badge on user messages */}
-              {m.csvName && (
+              {(m.csvName || m.jsonName) && (
                 <div className="msg-csv-badge">
-                  📄 {m.csvName}
+                  📄 {m.csvName || m.jsonName}
                 </div>
               )}
 
@@ -671,6 +818,12 @@ ${sessionSummary}${slimCsvBlock}
                     data={chart.data}
                     metricColumn={chart.metricColumn}
                   />
+                ) : chart._chartType === 'metric_vs_time' ? (
+                  <MetricVsTimeChart key={ci} data={chart.data} metricField={chart.metricField} />
+                ) : chart._chartType === 'play_video' && chart.video ? (
+                  <PlayVideoCard key={ci} video={chart.video} />
+                ) : chart._chartType === 'generated_image' && chart.imageBase64 ? (
+                  <GeneratedImageBlock key={ci} imageBase64={chart.imageBase64} mimeType={chart.mimeType} />
                 ) : null
               )}
 
@@ -697,9 +850,11 @@ ${sessionSummary}${slimCsvBlock}
             </div>
           ))}
           <div ref={bottomRef} />
+          </div>
+          )}
         </div>
 
-        {dragOver && <div className="chat-drop-overlay">Drop CSV or images here</div>}
+        {dragOver && <div className="chat-drop-overlay">Drop CSV, JSON, or images here</div>}
 
         {/* ── Input area ── */}
         <div className="chat-input-area">
@@ -712,6 +867,16 @@ ${sessionSummary}${slimCsvBlock}
                 {csvContext.rowCount} rows · {csvContext.headers.length} cols
               </span>
               <button className="csv-chip-remove" onClick={() => setCsvContext(null)} aria-label="Remove CSV">×</button>
+            </div>
+          )}
+
+          {/* JSON chip */}
+          {jsonContext && (
+            <div className="csv-chip">
+              <span className="csv-chip-icon">📋</span>
+              <span className="csv-chip-name">{jsonContext.name}</span>
+              <span className="csv-chip-meta">{jsonContext.videoCount} videos</span>
+              <button className="csv-chip-remove" onClick={() => { setJsonContext(null); setSessionJsonData(null); }} aria-label="Remove JSON">×</button>
             </div>
           )}
 
@@ -731,7 +896,7 @@ ${sessionSummary}${slimCsvBlock}
           <input
             ref={fileInputRef}
             type="file"
-            accept="image/*,.csv,text/csv"
+            accept="image/*,.csv,.json,text/csv,application/json"
             multiple
             style={{ display: 'none' }}
             onChange={handleFileSelect}
@@ -743,7 +908,7 @@ ${sessionSummary}${slimCsvBlock}
               className="attach-btn"
               onClick={() => fileInputRef.current?.click()}
               disabled={streaming}
-              title="Attach image or CSV"
+              title="Attach image, CSV, or JSON"
             >
               📎
             </button>
@@ -764,7 +929,7 @@ ${sessionSummary}${slimCsvBlock}
             ) : (
               <button
                 onClick={handleSend}
-                disabled={!input.trim() && !images.length && !csvContext}
+                disabled={!input.trim() && !images.length && !csvContext && !jsonContext}
               >
                 Send
               </button>
@@ -772,6 +937,7 @@ ${sessionSummary}${slimCsvBlock}
           </div>
         </div>
         </>
+        )}
       </div>
     </div>
   );

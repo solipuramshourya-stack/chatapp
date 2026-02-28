@@ -133,7 +133,9 @@ const fmt = (n) => +n.toFixed(4);
 // ── Build a slim CSV with only the key analytical columns ────────────────────
 // Extracts text, language, type, engagement metrics, and the computed engagement
 // ratio. Returns a plain CSV string Gemini can read directly in its context —
-// no base64 or Python needed. ~6-10k tokens for a 250-row tweet dataset.
+// no base64 or Python needed. Capped at 500 rows to stay under 1M token limit.
+
+const SLIM_MAX_ROWS = 150;
 
 const SLIM_PATTERNS = [
   /^text$/i,
@@ -155,18 +157,24 @@ export const buildSlimCsv = (rows, headers) => {
   const slimHeaders = headers.filter((h) => SLIM_PATTERNS.some((re) => re.test(h)));
   if (!slimHeaders.length) return '';
 
-  const escapeCell = (v) => {
-    const s = String(v ?? '');
+  const escapeCell = (v, isTextCol) => {
+    let s = String(v ?? '');
+    if (isTextCol && s.length > 200) s = s.slice(0, 200) + '…'; // truncate long text to save tokens
     return s.includes(',') || s.includes('"') || s.includes('\n')
       ? `"${s.replace(/"/g, '""')}"`
       : s;
   };
+  const isTextCol = (h) => /^text$/i.test(h);
 
+  const cappedRows = rows.slice(0, SLIM_MAX_ROWS);
   const lines = [
     slimHeaders.join(','),
-    ...rows.map((r) => slimHeaders.map((h) => escapeCell(r[h])).join(',')),
+    ...cappedRows.map((r) => slimHeaders.map((h) => escapeCell(r[h], isTextCol(h))).join(',')),
   ];
-  return lines.join('\n');
+  const suffix = rows.length > SLIM_MAX_ROWS
+    ? `\n# ... (${rows.length - SLIM_MAX_ROWS} more rows truncated; use tools for full analysis)`
+    : '';
+  return lines.join('\n') + suffix;
 };
 
 // ── Enrich rows with computed engagement column ───────────────────────────────
